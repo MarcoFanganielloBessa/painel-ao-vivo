@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""Atualiza o painel de progresso (.dashboard/index.html) sem gastar modelo.
+
+O horário vem sempre do relógio do sistema. Quem desenha o visual é o subagente
+dashboard-builder; este script só mexe no bloco <script type="application/json" id="estado">.
+
+  dashboard-update [--dir CAMINHO] agora
+  dashboard-update [--dir CAMINHO] tarefa ID [--estado E] [--nome N] [--nota T]
+  dashboard-update [--dir CAMINHO] entrega TEXTO
+  dashboard-update [--dir CAMINHO] decisao TEXTO
+  dashboard-update [--dir CAMINHO] pergunta ID TEXTO --padrao ACAO
+  dashboard-update [--dir CAMINHO] resolver ID
+  dashboard-update [--dir CAMINHO] trava ID MOTIVO
+  dashboard-update [--dir CAMINHO] destrava ID
+  dashboard-update [--dir CAMINHO] check
+
+Estados de tarefa: pendente, andando, revisao, correcao, feito, travado.
+Sem --dir, usa $DASHBOARD_DIR ou o .dashboard mais próximo subindo a partir do cwd.
+Fora do repositório (ex.: worktree em outra pasta), passe --dir com caminho absoluto.
+"""
+import argparse
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from datetime import datetime
+
+BLOCO = re.compile(r'(<script type="application/json" id="estado">)(.*?)(</script>)', re.S)
+ESTADOS = ("pendente", "andando", "revisao", "correcao", "feito", "travado")
+LIMITE = 40
+
+
+def agora():
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def achar_dir(explicito):
+    """--dir, depois $DASHBOARD_DIR, depois o .dashboard mais próximo subindo a partir do cwd."""
+    if explicito:
+        return explicito
+    if os.environ.get("DASHBOARD_DIR"):
+        return os.environ["DASHBOARD_DIR"]
+    p = os.getcwd()
+    while True:
+        c = os.path.join(p, ".dashboard")
+        if os.path.exists(os.path.join(c, "index.html")):
+            return c
+        if os.path.dirname(p) == p:
+            return ".dashboard"
+        p = os.path.dirname(p)
+
+
+def falhar(msg):
+    print(f"ERRO: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def abrir(arq):
+    if not os.path.exists(arq):
+        falhar(f"{arq} não existe (o dashboard-builder ainda não montou o painel?)")
+    with open(arq, encoding="utf-8") as f:
+        html = f.read()
+    m = BLOCO.search(html)
+    if not m:
+        falhar('bloco <script type="application/json" id="estado"> não encontrado')
+    try:
+        return html, m, json.loads(m.group(2))
+    except json.JSONDecodeError as e:
+        falhar(f"JSON do estado inválido: {e}")
+
+
+def gravar(arq, html, m, estado):
+    estado["atualizado_em"] = agora()
+    corpo = json.dumps(estado, ensure_ascii=False).replace("</", "<\\/")
+    novo = html[: m.start(2)] + corpo + html[m.end(2):]
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(arq) or ".", suffix=".tmp")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(novo)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, arq)
+
+
+def achar(lista, chave, valor):
+    return next((x for x in lista if x.get(chave) == valor), None)
+
+
+def registrar(e, chave, texto):
+    lista = e.setdefault(chave, [])
+    lista.insert(0, {"quando": agora(), "texto": texto})
+    del lista[LIMITE:]
+
+
+def op_tarefa(e, a):
+    tarefas = e.setdefault("tarefas", [])
+    t = achar(tarefas, "id", a.id)
+    if not t:
+        t = {"id": a.id, "nome": a.nome or a.id, "estado": "pendente", "desde": agora(), "nota": ""}
+        tarefas.append(t)
+    if a.nome:
+        t["nome"] = a.nome
+    if a.nota is not None:
+        t["nota"] = a.nota
+    if a.estado and a.estado != t["estado"]:
+        t["estado"], t["desde"] = a.estado, agora()
+
+
+def op_pergunta(e, a):
+    lista = e.setdefault("perguntas", [])
+    p = achar(lista, "id", a.id)
+    if not p:
+        p = {"id": a.id}
+        lista.append(p)
+    p.update(texto=a.texto, padrao=a.padrao, desde=agora(), resolvida=False)
+
+
+def op_resolver(e, a):
+    p = achar(e.get("perguntas", []), "id", a.id)
+    if not p:
+        falhar(f"pergunta {a.id} não existe")
+    p["resolvida"] = True
+
+
+def op_trava(e, a):
+    travas = e.setdefault("travas", [])
+    travas[:] = [t for t in travas if t.get("tarefa") != a.id]
+    travas.append({"tarefa": a.id, "motivo": a.motivo, "desde": agora()})
+    t = achar(e.get("tarefas", []), "id", a.id)
+    if t and t["estado"] != "travado":
+        t["estado"], t["desde"] = "travado", agora()
+
+
+def op_destrava(e, a):
+    e["travas"] = [t for t in e.get("travas", []) if t.get("tarefa") != a.id]
+    t = achar(e.get("tarefas", []), "id", a.id)
+    if t and t["estado"] == "travado":
+        t["estado"], t["desde"] = "andando", agora()
+
+
+OPERACOES = {
+    "tarefa": op_tarefa,
+    "entrega": lambda e, a: registrar(e, "entregas", a.texto),
+    "decisao": lambda e, a: registrar(e, "decisoes", a.texto),
+    "pergunta": op_pergunta,
+    "resolver": op_resolver,
+    "trava": op_trava,
+    "destrava": op_destrava,
+}
+
+
+def checar(arq):
+    html, _, e = abrir(arq)
+    erros = [f"estado sem '{k}'" for k in ("titulo", "tarefas", "perguntas", "entregas", "travas") if k not in e]
+    if not re.search(r'<meta[^>]*http-equiv=["\']refresh["\'][^>]*content=["\']10["\']', html, re.I):
+        erros.append('falta <meta http-equiv="refresh" content="10">')
+    scripts = [s for s in re.findall(r"<script(?![^>]*application/json)[^>]*>(.*?)</script>", html, re.S | re.I) if s.strip()]
+    for i, js in enumerate(scripts, 1):
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as f:
+            f.write(js)
+        try:
+            r = subprocess.run(["node", "--check", f.name], capture_output=True, text=True)
+            if r.returncode:
+                erros.append(f"JS do script {i}: " + " ".join(r.stderr.split())[:300])
+        except FileNotFoundError:
+            print("aviso: node não encontrado, JS não verificado", file=sys.stderr)
+            break
+        finally:
+            os.unlink(f.name)
+    if erros:
+        falhar("; ".join(erros))
+    print("OK")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="dashboard-update", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--dir")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("agora")
+    sub.add_parser("check")
+    t = sub.add_parser("tarefa")
+    t.add_argument("id")
+    t.add_argument("--estado", choices=ESTADOS)
+    t.add_argument("--nome")
+    t.add_argument("--nota")
+    for nome in ("entrega", "decisao"):
+        sub.add_parser(nome).add_argument("texto")
+    q = sub.add_parser("pergunta")
+    q.add_argument("id")
+    q.add_argument("texto")
+    q.add_argument("--padrao", required=True)
+    sub.add_parser("resolver").add_argument("id")
+    tr = sub.add_parser("trava")
+    tr.add_argument("id")
+    tr.add_argument("motivo")
+    sub.add_parser("destrava").add_argument("id")
+    a = p.parse_args()
+
+    if a.cmd == "agora":
+        print(agora())
+        return
+    pasta = achar_dir(a.dir)
+    arq = os.path.join(pasta, "index.html")
+    if a.cmd == "check":
+        checar(arq)
+        return
+    os.makedirs(pasta, exist_ok=True)
+    with open(os.path.join(pasta, ".lock"), "w") as trava:
+        fcntl.flock(trava, fcntl.LOCK_EX)
+        html, m, estado = abrir(arq)
+        OPERACOES[a.cmd](estado, a)
+        gravar(arq, html, m, estado)
+
+
+if __name__ == "__main__":
+    main()
